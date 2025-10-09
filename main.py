@@ -266,7 +266,8 @@ class MdtDialout(proto.mdt_grpc_dialout_pb2_grpc.gRPCMdtDialoutServicer):
             'clients_per_key_mgmt_type': {},
             'clients_per_wpa_version': {},
             'clients_per_phy_type': {},
-            'clients_per_ssid': {},
+            'clients_per_ssid': {},# wlan-profile
+            'clients_per_vap_ssid': {},    # vap-ssid separat
             'clients_per_policy': {},
             'clients_per_site': {},
             'clients_per_ap': {},
@@ -345,12 +346,20 @@ class MdtDialout(proto.mdt_grpc_dialout_pb2_grpc.gRPCMdtDialoutServicer):
                 except KeyError:
                     response_data['clients_per_ap'][access_point_name][this_client['ms-ap-slot-id']] = 1
 
-                # Clients by SSID
+                # Clients by WLAN-Profile
                 try:
                     response_data['clients_per_ssid'][this_client['wlan-profile']] = response_data['clients_per_ssid'][this_client['wlan-profile']] + 1
                 except KeyError:
                     response_data['clients_per_ssid'][this_client['wlan-profile']] = 1
 
+                # Clients by VAP SSID (separates Dict)
+                try:
+                    response_data.setdefault('clients_per_vap_ssid', {})
+                    response_data['clients_per_vap_ssid'][this_client['vap-ssid']] = \
+                        response_data['clients_per_vap_ssid'].get(this_client['vap-ssid'], 0) + 1
+                except KeyError:
+                    response_data['clients_per_vap_ssid'][this_client['vap-ssid']] = 1
+            
                 # Clients by Site
                 if this_client['ap-mac-address'] in this_controller["current_aps"]:
                     if this_controller["current_aps"][this_client['ap-mac-address']]['ap_site_tag']:
@@ -498,53 +507,135 @@ class MdtDialout(proto.mdt_grpc_dialout_pb2_grpc.gRPCMdtDialoutServicer):
             eprint(traceback.format_exc())
             return
 
+    #Influx Format Stage
     def InfluxFormatStage(self, response_data, controller_ip):
         write_points = []
         try:
-            write_points.append(Point('totals').field('total_clients', response_data['current_clients']))
-            write_points.append(Point('totals').field('total_6ghz_capable_clients', response_data['clients_6ghz_capable']))
+            # Totals
+            write_points.append(
+                Point("totals")
+                .tag("controller", controller_ip)
+                .field("total_clients", response_data['current_clients'])
+            )
+            write_points.append(
+                Point("totals")
+                .tag("controller", controller_ip)
+                .field("total_6ghz_capable_clients", response_data['clients_6ghz_capable'])
+            )
 
+            # Clients by PHY type
             for phy_type, total in response_data['clients_per_phy_type'].items():
-                Point('clients_by_phy_type').field(phy_type.replace('client-','').replace('-prot',''), total)
+                write_points.append(
+                    Point("client_count_phy_type")
+                    .tag("controller", controller_ip)
+                    .tag("phy_type", phy_type.replace('client-','').replace('-prot',''))
+                    .field("count", total)
+                )
 
+            # Clients by AP (gesamt)
             for ap_name, ap_client_data in response_data['clients_per_ap'].items():
-                total = 0
-                for slotname, slot in ap_client_data.items():
-                    total = total + slot
-                write_points.append(Point('clients_by_access_point').tag("policy_tag", response_data['aps'][ap_name]).field(ap_name, total))
+                total = sum(ap_client_data.values())
+                write_points.append(
+                    Point("client_count_per_ap")
+                    .tag("controller", controller_ip)
+                    .tag("ap", ap_name)
+                    .tag("policy_tag", response_data['aps'].get(ap_name, "unknown"))
+                    .field("count", total)
+                )
 
+            # Clients by AP + Slot
             for ap_name, ap_client_data in response_data['clients_per_ap'].items():
                 for slotname, slot in ap_client_data.items():
-                    write_points.append(Point('clients_by_access_point_by_slot').field("{}_{}".format(ap_name, slotname), slot))
+                    write_points.append(
+                        Point("client_count_per_ap_slot")
+                        .tag("controller", controller_ip)
+                        .tag("ap", ap_name)
+                        .tag("slot", slotname)
+                        .field("count", slot)
+                    )
 
-            for ssid_name, total in response_data['clients_per_ssid'].items():
-                write_points.append(Point('clients_by_ssid').tag("policy_tags", ','.join(response_data['ssids'][ssid_name])).field(ssid_name, total))
+            # Clients by SSID (wlan-profile + vap-ssid zusammen)
+            # Clients by WLAN Profile
+            for profile_name, total in response_data['clients_per_ssid'].items():
+                write_points.append(
+                    Point("client_count_wlan_profile")
+                    .tag("controller", controller_ip)
+                    .tag("wlan_profile", profile_name)
+                    .field("count", total)
+                )
 
+            # Clients by VAP SSID
+            if "clients_per_vap_ssid" in response_data:
+                for vap_ssid, total in response_data['clients_per_vap_ssid'].items():
+                    write_points.append(
+                        Point("client_count_vap_ssid")
+                        .tag("controller", controller_ip)
+                        .tag("vap_ssid", vap_ssid)
+                        .field("count", total)
+                    )
+
+            # Clients by Site
             for site_tag, total in response_data['clients_per_site'].items():
-                write_points.append(Point('clients_by_site').field(site_tag, total))
+                write_points.append(
+                    Point("client_count_site_tag")
+                    .tag("controller", controller_ip)
+                    .tag("site_tag", site_tag)
+                    .field("count", total)
+                )
 
+            # Clients by Policy
             for policy_tag, total in response_data['clients_per_policy'].items():
-                write_points.append(Point('clients_by_policy_tag').field(policy_tag, total))
+                write_points.append(
+                    Point("client_count_policy_tag")
+                    .tag("controller", controller_ip)
+                    .tag("policy_tag", policy_tag)
+                    .field("count", total)
+                )
 
+            # Clients by WPA Version
             for wpa_version, total in response_data['clients_per_wpa_version'].items():
-                write_points.append(Point('clients_by_wpa_version').field(wpa_version, total))
+                write_points.append(
+                    Point("client_count_wpa_version")
+                    .tag("controller", controller_ip)
+                    .tag("wpa_version", wpa_version)
+                    .field("count", total)
+                )
 
+            # Clients by Key Management
             for key_mgmt_type, total in response_data['clients_per_key_mgmt_type'].items():
-                write_points.append(Point('clients_by_key_mgmt_type').field(key_mgmt_type, total))
+                write_points.append(
+                    Point("client_count_key_mgmt_type")
+                    .tag("controller", controller_ip)
+                    .tag("key_mgmt_type", key_mgmt_type)
+                    .field("count", total)
+                )
+
+             # NEU: AP Channel per Slot
+            if "ap_channel_per_slot" in response_data:
+                for ap_name, ap_channel_data in response_data['ap_channel_per_slot'].items():
+                    for slotname, channel in ap_channel_data.items():
+                        if channel != 0:
+                            write_points.append(
+                                Point("ap_channel")
+                                .tag("controller", controller_ip)
+                                .tag("ap", ap_name)
+                                .tag("slot", slotname)
+                                .field("channel", int(channel))
+                            )
 
         except Exception as e:
-            eprint("Failed to process ZabbixFormatStage for controller {} - {} {}".format(controller_ip,type(e),e))
+            eprint("Failed to process InfluxFormatStage for controller {} - {} {}".format(controller_ip, type(e), e))
             eprint(traceback.format_exc())
             return
 
         # Write points to influx
         bucket_name = str(os.getenv("INFLUX_BUCKET"))
-        if bucket_name is None or len(bucket_name) == 0:
+        if not bucket_name:
             eprint("Influx config is invalid. Bucket name is not set. Please set INFLUX_BUCKET")
             return
 
         self.WriteToInflux(write_points, bucket_name)
-
+        
     def WriteToInflux(self, data_points, bucket_name):
         with self.influx_client_connection.write_api(write_options=WriteOptions(batch_size=50_000, flush_interval=10_000)) as write_api:
             for point in data_points:
